@@ -1,0 +1,121 @@
+---
+- name: Install AWS MGN agent on Windows
+  hosts: all
+  gather_facts: true
+
+  vars:
+    mgn_min_root_free_gib: 2
+    mgn_min_root_free_bytes: "{{ (mgn_min_root_free_gib | int) * 1024 * 1024 * 1024 }}"
+    aws_region: "{{ lookup('env', 'AWS_REGION') | default(lookup('env', 'AWS_DEFAULT_REGION'), true) | default('us-east-1', true) }}"
+    aws_access_key_id: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    aws_secret_access_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+    aws_session_token: "{{ lookup('env', 'AWS_SESSION_TOKEN') }}"
+    mgn_installer_dir: 'C:\Temp\AwsMgnAgent'
+    mgn_installer_name: AwsReplicationWindowsInstaller.exe
+    mgn_installer_url: "https://aws-application-migration-service-{{ aws_region }}.s3.{{ aws_region }}.amazonaws.com/latest/windows/{{ mgn_installer_name }}"
+    mgn_user_provided_id: ""
+    mgn_endpoint: ""
+    mgn_s3_endpoint: ""
+    mgn_no_replication: false
+    mgn_dualstack: false
+
+  tasks:
+    - name: Skip non-Windows hosts
+      ansible.builtin.meta: end_host
+      when: ansible_system != 'Win32NT'
+
+    - name: Validate AWS credentials are available to the controller
+      ansible.builtin.assert:
+        that:
+          - aws_region | length > 0
+          - aws_access_key_id | length > 0
+          - aws_secret_access_key | length > 0
+          - aws_session_token | length > 0
+        fail_msg: "AWS_REGION or AWS_DEFAULT_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN must be set before installing the Windows MGN agent."
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Check Windows C drive free space
+      ansible.windows.win_powershell:
+        script: |
+          $drive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
+          if (-not $drive) {
+              throw 'C: drive was not found.'
+          }
+          [int64]$drive.FreeSpace
+      register: windows_c_free
+      changed_when: false
+
+    - name: Assert Windows C drive free space
+      ansible.builtin.assert:
+        that:
+          - windows_c_free.output[0] | int >= mgn_min_root_free_bytes | int
+        fail_msg: "Windows C: drive must have at least {{ mgn_min_root_free_gib }} GiB free before installing the MGN agent."
+
+    - name: Create Windows MGN installer directory
+      ansible.windows.win_file:
+        path: "{{ mgn_installer_dir }}"
+        state: directory
+
+    - name: Download Windows MGN installer
+      ansible.windows.win_get_url:
+        url: "{{ mgn_installer_url }}"
+        dest: "{{ mgn_installer_dir }}\\{{ mgn_installer_name }}"
+
+    - name: Install Windows MGN agent
+      ansible.windows.win_powershell:
+        script: |
+          param(
+              [string]$MgnInstallerDir,
+              [string]$MgnInstallerName,
+              [string]$AwsRegion,
+              [string]$AwsAccessKeyId,
+              [string]$AwsSecretAccessKey,
+              [string]$AwsSessionToken,
+              [string]$MgnUserProvidedId,
+              [string]$MgnEndpoint,
+              [string]$MgnS3Endpoint,
+              [string]$MgnNoReplication,
+              [string]$MgnDualstack
+          )
+          $InstallerPath = Join-Path $MgnInstallerDir $MgnInstallerName
+          $AgentArgs = @(
+              '--region', $AwsRegion,
+              '--aws-access-key-id', $AwsAccessKeyId,
+              '--aws-secret-access-key', $AwsSecretAccessKey,
+              '--aws-session-token', $AwsSessionToken,
+              '--no-prompt'
+          )
+          if ($MgnUserProvidedId) {
+              $AgentArgs += @('--user-provided-id', $MgnUserProvidedId)
+          }
+          if ($MgnEndpoint) {
+              $AgentArgs += @('--endpoint', $MgnEndpoint)
+          }
+          if ($MgnS3Endpoint) {
+              $AgentArgs += @('--s3-endpoint', $MgnS3Endpoint)
+          }
+          if ($MgnNoReplication -eq 'true') {
+              $AgentArgs += '--no-replication'
+          }
+          if ($MgnDualstack -eq 'true') {
+              $AgentArgs += '--dualstack'
+          }
+          & $InstallerPath @AgentArgs
+          if ($LASTEXITCODE -ne 0) {
+              throw "AWS MGN agent installer exited with code $LASTEXITCODE"
+          }
+        parameters:
+          MgnInstallerDir: "{{ mgn_installer_dir }}"
+          MgnInstallerName: "{{ mgn_installer_name }}"
+          AwsRegion: "{{ aws_region }}"
+          AwsAccessKeyId: "{{ aws_access_key_id }}"
+          AwsSecretAccessKey: "{{ aws_secret_access_key }}"
+          AwsSessionToken: "{{ aws_session_token }}"
+          MgnUserProvidedId: "{{ mgn_user_provided_id }}"
+          MgnEndpoint: "{{ mgn_endpoint }}"
+          MgnS3Endpoint: "{{ mgn_s3_endpoint }}"
+          MgnNoReplication: "{{ mgn_no_replication | bool | ternary('true', 'false') }}"
+          MgnDualstack: "{{ mgn_dualstack | bool | ternary('true', 'false') }}"
+      no_log: true

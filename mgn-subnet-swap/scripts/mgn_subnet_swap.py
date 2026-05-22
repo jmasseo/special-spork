@@ -218,6 +218,14 @@ def create_and_default_launch_template_version(
     source_version: str,
     launch_template_data: dict[str, Any],
 ) -> str:
+    current_default = get_launch_template_default(ec2_client, launch_template_id)
+    current_default_version = str(current_default["VersionNumber"])
+    if current_default_version != source_version:
+        raise RuntimeError(
+            f"Default version for launch template {launch_template_id} changed "
+            f"from {source_version} to {current_default_version}; aborting"
+        )
+
     response = ec2_client.create_launch_template_version(
         LaunchTemplateId=launch_template_id,
         SourceVersion=source_version,
@@ -226,6 +234,15 @@ def create_and_default_launch_template_version(
         ClientToken=str(uuid.uuid4()),
     )
     version = str(response["LaunchTemplateVersion"]["VersionNumber"])
+    current_default = get_launch_template_default(ec2_client, launch_template_id)
+    current_default_version = str(current_default["VersionNumber"])
+    if current_default_version != source_version:
+        raise RuntimeError(
+            f"Default version for launch template {launch_template_id} changed "
+            f"from {source_version} to {current_default_version} after creating "
+            f"version {version}; leaving default unchanged"
+        )
+
     ec2_client.modify_launch_template(
         LaunchTemplateId=launch_template_id,
         DefaultVersion=version,

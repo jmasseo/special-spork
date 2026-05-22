@@ -36,6 +36,9 @@ sets them as default when `--execute` is supplied.
 - Rebuilding template data can drop settings. The script creates the new version
   from the existing default version and submits only the modified network
   interface list, so other launch template fields are inherited unchanged.
+- Another operator could change the launch template default while the script is
+  running. Execute mode re-checks the default version before setting the new
+  default and aborts if it changed after inspection.
 - Setting the new version as default changes future MGN test/cutover launches.
   That write path requires `--execute`.
 

@@ -1,0 +1,53 @@
+---
+- name: Prepare Linux hosts for MGN migration
+  hosts: all
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Skip non-Linux hosts
+      ansible.builtin.meta: end_host
+      when: ansible_system == 'Win32NT'
+
+    - name: Skip unsupported Linux families
+      ansible.builtin.meta: end_host
+      when: ansible_os_family != 'Debian'
+
+    - name: Detect latest installed Debian or Ubuntu kernel
+      ansible.builtin.shell: |
+        set -o pipefail
+        dpkg --list 'linux-image-[0-9]*' 2>/dev/null \
+          | awk '/^ii/ {print $2}' \
+          | sed 's/^linux-image-//' \
+          | sort -V \
+          | tail -n1
+      args:
+        executable: /bin/bash
+      register: latest_installed_kernel
+      changed_when: false
+
+    - name: Verify latest installed kernel was detected
+      ansible.builtin.assert:
+        that:
+          - latest_installed_kernel.stdout | length > 0
+        fail_msg: "Could not detect the latest installed Debian-family kernel package."
+
+    - name: Reboot if not running the latest installed kernel
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 90
+        msg: "Rebooting before MGN migration because the running kernel is not the latest installed kernel."
+      when:
+        - latest_installed_kernel.stdout | length > 0
+        - ansible_kernel != latest_installed_kernel.stdout
+
+    - name: Refresh facts after possible reboot
+      ansible.builtin.setup:
+
+    - name: Verify Linux host is running the latest installed kernel
+      ansible.builtin.assert:
+        that:
+          - ansible_kernel == latest_installed_kernel.stdout
+        fail_msg: "Host is still running {{ ansible_kernel }}, but latest installed kernel is {{ latest_installed_kernel.stdout }}."
+        success_msg: "Host is running the latest installed kernel: {{ ansible_kernel }}."
+      when: latest_installed_kernel.stdout | length > 0

@@ -1,28 +1,23 @@
 ---
-# this probably would have been a quicker delivery and a safer execution in bash
-
 - name: Kernel pinning
   hosts: all
-  gather_facts: false
+  gather_facts: true
   become: true
   serial: 1
 
   vars:
-    # pin_state: name of some college or something, right?
     # present = pin previous kernel and set as grub default
     # absent = undo recorded hold and restore previous GRUB_DEFAULT
     pin_state: present
 
-    # Colonel O'Truth
     # "auto" = choose next to newest in /boot/vmlinuz*
     # or explicitly set e.g. '5.15.0-176-generic'
     target_kernel: auto
 
-    # 20 01 a sparse oddity
-    # do-nothing mode
+    # Report the intended change without modifying host state.
     audit_only: false
 
-    # repost /boot
+    # Reboot after setting the target kernel as the default.
     reboot_post: false
 
 
@@ -34,12 +29,15 @@
 
     mark_as_auto_post: false
 
-  pre-tasks:
-    - name: require debian flavor
-      ansible.builtin.assert: 
-        that:
-          - ansible_os_family == "Debian"
-        fail_msg: "doesn't look like debian or zooboomafoo"
+  pre_tasks:
+    - name: Skip non-Linux hosts
+      ansible.builtin.meta: end_host
+      when: ansible_system == 'Win32NT'
+
+    - name: Skip unsupported Linux families
+      ansible.builtin.meta: end_host
+      when: ansible_os_family != "Debian"
+
     - name: require grub config
       ansible.builtin.stat:
         path: "{{ grub_cfg_file }}"
@@ -47,14 +45,14 @@
     - name: fail if no grub
       ansible.builtin.assert:
         that:
-          - grub_cfg_stat.exists
+          - grub_cfg_stat.stat.exists
         fail_msg: "{{ grub_cfg_file }} does not exist."
 
   tasks:
     - name: discover kernels
       ansible.builtin.shell: |
         set -euo pipefail
-        for f in /boot/vmlinux-*; do
+        for f in /boot/vmlinuz-*; do
           [ -e "$f" ]  || continue
           basename "$f" | sed 's/^vmlinuz-//'
         done | sort -V
@@ -76,7 +74,7 @@
       when: target_kernel == "auto"
 
     - name: resolve target kernel
-      ansible.buildin.set_fact:
+      ansible.builtin.set_fact:
         target_kernel_resolved: "{{ (target_kernel == 'auto') | ternary(installed_kernels[-2], target_kernel) }}"
 
     - name: resolve kernel abi
@@ -88,7 +86,7 @@
         that:
           - target_kernel_resolved in installed_kernels
         fail_msg: "{{ target_kernel_resolved }} not in in list from /boot"
-    
+
     - name: find a match (not a recovery mode)
       ansible.builtin.shell: |
         set -euo pipefail
@@ -99,17 +97,17 @@
             line=$0
             sub(/^[[:space:]]*submenu[[:space:]]+'\''/, "", line)
             sub('\''.*/, "", line)
-            submenu=linenext
+            submenu=line
             }
-          
+
           /^[[:space:]]*menuentry / {
             line=$0
-            
+
             sub(/^[[:space:]]*menuentry[[:space:]]+'\''/, "", line)
             sub('\''.*/, "", line)
-            
+
             if (index(line, k) > 0 && line !~ /recovery mode/) {
-              if (submenu != ::) {
+              if (submenu != "") {
                 print submenu ">" line
               } else {
                 print line
@@ -119,7 +117,7 @@
           }
         ' "{{ grub_cfg_file }}"
       args:
-        executable: /bin/bash     
+        executable: /bin/bash
       register: grub_entry_lookup
       changed_when: false
       failed_when: grub_entry_lookup.stdout | trim == ""
@@ -152,14 +150,14 @@
       register: target_kernel_package_lookup
       changed_when: false
       check_mode: false
-    
+
     - name: store target kernel package list
       ansible.builtin.set_fact:
         target_kernel_packages: "{{ target_kernel_package_lookup.stdout_lines }}"
 
     - name: require at least one matching kernel package
       ansible.builtin.assert:
-        that: 
+        that:
           - target_kernel_packages | length > 0
         fail_msg: "no installed kernel-image/headers/modules/something matched {{ target_kernel }}"
 
@@ -172,13 +170,13 @@
           - "target kernel: {{ target_kernel_resolved }}"
           - "target abi: {{ target_kernel_abi }}"
           - "grub default: {{ grub_default_entry }}"
-          - "packages to hold/unhold {{ target_kernel_packages | join(', ')  }}"
+          - "packages to hold/unhold {{ target_kernel_packages | join(', ') }}"
           - "state: {{ pin_state }}"
           - "audit only: {{ audit_only }}"
           - "reboot post: {{ reboot_post }}"
 
     - name: pin kernel and set grub default
-      when: 
+      when:
         - pin_state == "present"
         - not audit_only | bool
       block:
@@ -216,8 +214,8 @@
             owner: root
             group: root
             mode: "0600"
-          when: not grub_default_bhefore_stat.stat.exists
-        
+          when: not grub_default_before_stat.stat.exists
+
         - name: record target kernel
           ansible.builtin.copy:
             dest: "{{ state_dir }}/target_kernel"
@@ -225,11 +223,11 @@
             owner: root
             group: root
             mode: "0600"
-        
+
         - name: record held packages
           ansible.builtin.copy:
             dest: "{{ state_dir }}/packages"
-            content: "{{ target_kernel_packages | join(']\n') }}\n"
+            content: "{{ target_kernel_packages | join('\n') }}\n"
             owner: root
             group: root
             mode: "0600"
@@ -256,7 +254,7 @@
           notify: update grub
 
     - name: restore grub default and unhold recorded packages
-      when:  
+      when:
         - pin_state == "absent"
         - not audit_only | bool
       block:
@@ -267,12 +265,12 @@
 
         - name: read recorded pkg list
           ansible.builtin.slurp:
-            path: "{{ state_dir }}/packages"
-            register: recorded_packages_slurp
+            src: "{{ state_dir }}/packages"
+          register: recorded_packages_slurp
           when: recorded_packages_stat.stat.exists
 
         - name: resolve packages to unhold
-          ansible.builtin.set_fact: 
+          ansible.builtin.set_fact:
             packages_to_unhold: >-
               {{
                 (
@@ -281,20 +279,21 @@
                 if recorded_packages_stat.stat.exists
                 else target_kernel_packages
               }}
-        
-        - namne: unhold packages
-          ansible.builtin.pkg_selections:
+
+        - name: unhold packages
+          ansible.builtin.dpkg_selections:
             name: "{{ item }}"
             selection: install
-          loop: "{{ packages_to_unhold | length > 0 }}"
+          loop: "{{ packages_to_unhold }}"
+          when: packages_to_unhold | length > 0
 
         - name: mark auto
           ansible.builtin.command:
             argv: "{{ ['apt-mark', 'auto'] + packages_to_unhold }}"
           register: apt_mark_auto_result
-          changed_when: "set previously held packages to auto-installed"
+          changed_when: "'set to auto' in apt_mark_auto_result.stdout"
           when:
-            - mark_targety_kernel_auto_on_restore | bool
+            - mark_as_auto_post | bool
             - packages_to_unhold | length > 0
 
         - name: check recorded previous default
@@ -304,11 +303,11 @@
 
         - name: read recorded previous default
           ansible.builtin.slurp:
-            path: "{{ state_dir }}/grub_default.before"
+            src: "{{ state_dir }}/grub_default.before"
           register: restore_grub_default_slurp
           when: restore_grub_default_stat.stat.exists
 
-        - nanme: resolve default to restore
+        - name: resolve default to restore
           ansible.builtin.set_fact:
             grub_default_to_restore: >-
               {{
@@ -318,6 +317,7 @@
                 if restore_grub_default_stat.stat.exists
                 else fallback_restore_to
               }}
+
         - name: restore default
           ansible.builtin.lineinfile:
             path: "{{ grub_defaults_file }}"
@@ -330,9 +330,9 @@
       ansible.builtin.meta: flush_handlers
       when: not audit_only | bool
 
-    - name: reboot 
+    - name: reboot
       ansible.builtin.reboot:
-        msg: "rebooting to apply selected grub }/target_kernel"
+        msg: "Rebooting to activate kernel {{ target_kernel_resolved }}"
         reboot_timeout: 600
         post_reboot_delay: 10
       when:
@@ -345,16 +345,17 @@
       ansible.builtin.setup:
       when:
         - pin_state == "present"
-        - reboot_post | bool 
+        - reboot_post | bool
         - not audit_only | bool
 
     - name: show kernel state
       ansible.builtin.debug:
-        - "host: {{ inventory_hostname }}"
-        - "final observed kernel: {{ ansible_kernel }}"
-        - "target kernel: {{ target_kernel_resolved }}"
-        - "reboot requested: {{ reboot_post }}"
+        msg:
+          - "host: {{ inventory_hostname }}"
+          - "final observed kernel: {{ ansible_kernel }}"
+          - "target kernel: {{ target_kernel_resolved }}"
+          - "reboot requested: {{ reboot_post }}"
 
-  handlers: 
+  handlers:
     - name: update grub
       ansible.builtin.command: update-grub

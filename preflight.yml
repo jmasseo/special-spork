@@ -1,0 +1,56 @@
+---
+- name: MGN migration preflight
+  hosts: all
+  gather_facts: true
+
+  vars:
+    mgn_min_root_free_gib: 2
+    mgn_min_root_free_bytes: "{{ (mgn_min_root_free_gib | int) * 1024 * 1024 * 1024 }}"
+    aws_region: "{{ lookup('env', 'AWS_REGION') | default(lookup('env', 'AWS_DEFAULT_REGION'), true) | default('us-east-1', true) }}"
+    aws_access_key_id: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    aws_secret_access_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+    aws_session_token: "{{ lookup('env', 'AWS_SESSION_TOKEN') }}"
+
+  tasks:
+    - name: Validate AWS credentials are available to the controller
+      ansible.builtin.assert:
+        that:
+          - aws_region | length > 0
+          - aws_access_key_id | length > 0
+          - aws_secret_access_key | length > 0
+          - aws_session_token | length > 0
+        fail_msg: "AWS_REGION or AWS_DEFAULT_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN must be set before running MGN playbooks."
+        success_msg: "Required AWS environment variables are present."
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Check Linux root filesystem free space
+      ansible.builtin.assert:
+        that:
+          - root_available_bytes | int >= mgn_min_root_free_bytes | int
+        fail_msg: "Linux root filesystem must have at least {{ mgn_min_root_free_gib }} GiB free before proceeding."
+        success_msg: "Linux root filesystem has at least {{ mgn_min_root_free_gib }} GiB free."
+      vars:
+        root_available_bytes: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | default(0) }}"
+      when: ansible_system != 'Win32NT'
+
+    - name: Check Windows C drive free space
+      ansible.windows.win_powershell:
+        script: |
+          $drive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
+          if (-not $drive) {
+              throw 'C: drive was not found.'
+          }
+          [int64]$drive.FreeSpace
+      register: windows_c_free
+      changed_when: false
+      when: ansible_system == 'Win32NT'
+
+    - name: Assert Windows C drive free space
+      ansible.builtin.assert:
+        that:
+          - windows_c_free.output[0] | int >= mgn_min_root_free_bytes | int
+        fail_msg: "Windows C: drive must have at least {{ mgn_min_root_free_gib }} GiB free before proceeding."
+        success_msg: "Windows C: drive has at least {{ mgn_min_root_free_gib }} GiB free."
+      when: ansible_system == 'Win32NT'

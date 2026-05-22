@@ -1,0 +1,15 @@
+---
+- name: Run MGN migration preflight
+  import_playbook: preflight.yml
+
+- name: Prepare supported Linux hosts
+  import_playbook: linux_prepare.yml
+
+- name: Downgrade Ubuntu 24 kernels where required
+  import_playbook: downgrade.yml
+
+- name: Install Linux MGN agent
+  import_playbook: agent.yml
+
+- name: Install Windows MGN agent
+  import_playbook: windows_agent.yml

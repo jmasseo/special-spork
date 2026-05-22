@@ -1,40 +1,56 @@
 ---
 - name: Kernel revert
   hosts: all
-  gather_facts: false
+  gather_facts: true
   become: true
 
   vars:
     remote_script_dir: /opt/kernel-migration
+    mgn_state_file: /var/lib/kernel-migration/state.env
 
   tasks:
+    - name: Skip non-Linux hosts
+      ansible.builtin.meta: end_host
+      when: ansible_system == 'Win32NT'
+
+    - name: Check for kernel-migration state file
+      ansible.builtin.stat:
+        path: "{{ mgn_state_file }}"
+      register: mgn_state_stat
+
+    - name: Skip hosts with no downgrade state
+      ansible.builtin.meta: end_host
+      when: not mgn_state_stat.stat.exists
+
     - name: Run kernel-grub-reset script
-      command: "{{ remote_script_dir }}/kernel-grub-reset.sh"
+      ansible.builtin.command: "{{ remote_script_dir }}/kernel-grub-reset.sh"
       register: grub_reset_result
-      changed_when: grub_reset_result.rc == 0
+      changed_when: "'GRUB reset complete' in grub_reset_result.stdout"
 
     - name: Reboot after GRUB reset
-      reboot:
+      ansible.builtin.reboot:
         reboot_timeout: 300
         post_reboot_delay: 90
         msg: "Rebooting to activate reset GRUB default"
+      when: grub_reset_result is changed
 
     - name: Run revert script
-      command: "{{ remote_script_dir }}/revert.sh"
+      ansible.builtin.command: "{{ remote_script_dir }}/revert.sh"
       register: revert_result
-      changed_when: revert_result.rc == 0
+      changed_when: "'Revert complete' in revert_result.stdout"
 
     - name: Reboot after revert
-      reboot:
+      ansible.builtin.reboot:
         reboot_timeout: 300
         post_reboot_delay: 90
         msg: "Rebooting after kernel revert"
+      when: revert_result is changed
 
     - name: Check kernel version
-      command: uname -a
+      ansible.builtin.command: uname -a
       register: uname_out
       changed_when: false
 
     - name: Show kernel version
-      debug:
+      ansible.builtin.debug:
         msg: "{{ uname_out.stdout }}"

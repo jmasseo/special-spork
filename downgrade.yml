@@ -1,22 +1,40 @@
 ---
 - name: Kernel downgrade
   hosts: all
-  gather_facts: false
+  gather_facts: true
   become: true
   serial: 1
 
   vars:
     remote_script_dir: /opt/kernel-migration
+    mgn_min_root_free_gib: 2
+    mgn_min_root_free_bytes: "{{ (mgn_min_root_free_gib | int) * 1024 * 1024 * 1024 }}"
 
   tasks:
+    - name: Skip non-Linux hosts
+      ansible.builtin.meta: end_host
+      when: ansible_system == 'Win32NT'
+
+    - name: Skip hosts that are not Ubuntu 24.04
+      ansible.builtin.meta: end_host
+      when: not (ansible_distribution == 'Ubuntu' and ansible_distribution_version is version('24.04', '=='))
+
+    - name: Assert Linux root filesystem free space
+      ansible.builtin.assert:
+        that:
+          - root_available_bytes | int >= mgn_min_root_free_bytes | int
+        fail_msg: "Linux root filesystem must have at least {{ mgn_min_root_free_gib }} GiB free before kernel downgrade."
+      vars:
+        root_available_bytes: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | default(0) }}"
+
     - name: Create remote script directory
-      file:
+      ansible.builtin.file:
         path: "{{ remote_script_dir }}"
         state: directory
         mode: "0750"
 
     - name: Copy scripts
-      copy:
+      ansible.builtin.copy:
         src: "{{ item }}"
         dest: "{{ remote_script_dir }}/{{ item }}"
         mode: "0750"
@@ -26,28 +44,29 @@
         - kernel-grub-reset.sh
 
     - name: Run downgrade script
-      command: "{{ remote_script_dir }}/downgrade.sh"
+      ansible.builtin.command: "{{ remote_script_dir }}/downgrade.sh"
       register: downgrade_result
-      changed_when: downgrade_result.rc == 0
+      changed_when: "'Downgrade complete' in downgrade_result.stdout"
 
     - name: Reboot after successful downgrade
-      reboot:
+      ansible.builtin.reboot:
         reboot_timeout: 600
         post_reboot_delay: 300
         msg: "Rebooting to activate downgraded kernel"
+      when: downgrade_result is changed
 
     - name: Check kernel version
-      command: uname -a
+      ansible.builtin.command: uname -a
       register: uname_out
       changed_when: false
 
     - name: Check memory
-      command: free
+      ansible.builtin.command: free
       register: free_out
       changed_when: false
 
     - name: Show post-reboot results
-      debug:
+      ansible.builtin.debug:
         msg:
           - "{{ uname_out.stdout }}"
           - "{{ free_out.stdout }}"

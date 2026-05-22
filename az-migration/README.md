@@ -22,6 +22,10 @@ The migration flow is intentionally conservative:
    - source EBS volume tags to replacement EBS volumes by device name
    - source EBS volume tags to AMI snapshots by device name
    - source network interface tags to replacement network interfaces by device index
+   By default, synchronization adds missing tags and updates changed values without
+   deleting tags that already exist on the replacement resources. Use
+   `--prune-tags` during `migrate` to remove user-managed target tags that are
+   not present on the corresponding source resource.
 7. Wait for the replacement instance to reach `running` and write a timestamped migration log under `logs/`.
 
 The source instance is not stopped or terminated by `migrate`. Cleanup is a separate explicit command.
@@ -76,6 +80,16 @@ python scripts/ec2-migrate.py migrate \
   --instance-id i-1234567890abcdef0 \
   --target-az us-east-1b \
   --no-reboot
+```
+
+To make target resource tags exactly match the corresponding source resources,
+including removal of extra user-managed tags on the targets:
+
+```bash
+python scripts/ec2-migrate.py migrate \
+  --instance-id i-1234567890abcdef0 \
+  --target-az us-east-1b \
+  --prune-tags
 ```
 
 ### Validate
@@ -167,11 +181,13 @@ Minimum EC2 permissions for migration and validation:
     "ec2:CreateTags",
     "ec2:DeleteTags",
     "ec2:DescribeImages",
+    "ec2:DescribeInstanceAttribute",
     "ec2:DescribeInstanceStatus",
     "ec2:DescribeInstances",
     "ec2:DescribeSubnets",
     "ec2:DescribeTags",
     "ec2:DescribeVolumes",
+    "ec2:ModifyInstanceAttribute",
     "ec2:RunInstances"
   ],
   "Resource": "*"

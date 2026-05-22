@@ -84,6 +84,7 @@ class EC2Migrator:
         region: str | None,
         dry_run: bool,
         no_reboot: bool,
+        prune_tags: bool,
     ) -> None:
         session = aws_session(profile, region)
         self.ec2 = session.client("ec2")
@@ -92,6 +93,7 @@ class EC2Migrator:
         self.target_subnet = target_subnet
         self.dry_run = dry_run
         self.no_reboot = no_reboot
+        self.prune_tags = prune_tags
         self.source_instance: dict[str, Any] | None = None
         self.source_userdata: str | None = None
         self.source_termination_protection: bool = False
@@ -317,7 +319,7 @@ class EC2Migrator:
         desired = {tag["Key"]: tag["Value"] for tag in user_tags(desired_tags)}
         current = {tag["Key"]: tag["Value"] for tag in user_tags(self.describe_resource_tags(resource_id))}
 
-        extra_keys = sorted(key for key in current if key not in desired)
+        extra_keys = sorted(key for key in current if key not in desired) if self.prune_tags else []
         tags_to_set = [
             {"Key": key, "Value": value}
             for key, value in sorted(desired.items())
@@ -583,6 +585,7 @@ def migrate(args: argparse.Namespace) -> int:
             region=args.region,
             dry_run=args.dry_run,
             no_reboot=args.no_reboot,
+            prune_tags=args.prune_tags,
         )
         result = migrator.run()
         result.log_file = log_file
@@ -613,6 +616,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-reboot",
         action="store_true",
         help="Create the AMI without rebooting the source instance",
+    )
+    migrate_parser.add_argument(
+        "--prune-tags",
+        action="store_true",
+        help="Remove user-managed target tags that are not present on the source resource",
     )
     migrate_parser.set_defaults(func=migrate)
 

@@ -1,61 +1,76 @@
 ---
-- name: Set AWS environment variables and execute program in user's home directory
+- name: Install AWS MGN agent on Linux
   hosts: all
   gather_facts: yes
   become: true
 
   vars:
     # Override these on the command line with -e or in a vars file/vault.
-    # Example: ansible-playbook aws_run_program.yml -e "program_name=my_script.sh"
+    # Example: ansible-playbook agent.yml -e "aws_region=us-east-1"
     program_name: "aws-replication-installer-init"
-    program_url: "https://aws-application-migration-service-us-east-1.s3.us-east-1.amazonaws.com/latest/linux/aws-replication-installer-init"
-    program_args: "--no-prompt --region us-east-1"
-    homedir: "/home/jmasseo"
+    aws_region: "{{ lookup('env', 'AWS_REGION') | default(lookup('env', 'AWS_DEFAULT_REGION'), true) | default('us-east-1', true) }}"
+    program_url: "https://aws-application-migration-service-{{ aws_region }}.s3.{{ aws_region }}.amazonaws.com/latest/linux/{{ program_name }}"
+    program_args:
+      - "--no-prompt"
+      - "--region"
+      - "{{ aws_region }}"
+    installer_dir: "/opt/aws-mgn"
+    mgn_min_root_free_gib: 2
+    mgn_min_root_free_bytes: "{{ (mgn_min_root_free_gib | int) * 1024 * 1024 * 1024 }}"
     aws_access_key_id: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
     aws_secret_access_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
     aws_session_token: "{{ lookup('env', 'AWS_SESSION_TOKEN') }}"
-    aws_default_region: "{{ lookup('env', 'AWS_DEFAULT_REGION') | default('us-east-1', true) }}"
  
   tasks:
-    - name: Download the MGN installer to the user's home directory
+    - name: Skip non-Linux hosts
+      ansible.builtin.meta: end_host
+      when: ansible_system == 'Win32NT'
+
+    - name: Assert Linux root filesystem free space
+      ansible.builtin.assert:
+        that:
+          - root_available_bytes | int >= mgn_min_root_free_bytes | int
+        fail_msg: "Linux root filesystem must have at least {{ mgn_min_root_free_gib }} GiB free before installing the MGN agent."
+      vars:
+        root_available_bytes: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | default(0) }}"
+
+    - name: Validate AWS credentials are available to the controller
+      ansible.builtin.assert:
+        that:
+          - aws_region | length > 0
+          - aws_access_key_id | length > 0
+          - aws_secret_access_key | length > 0
+          - aws_session_token | length > 0
+        fail_msg: "AWS_REGION or AWS_DEFAULT_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN must be set before installing the Linux MGN agent."
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Create Linux MGN installer directory
+      ansible.builtin.file:
+        path: "{{ installer_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Download the Linux MGN installer
       ansible.builtin.get_url:
         url: "{{ program_url }}"
-        dest: "{{ homedir }}/{{ program_name }}"
-        mode: "0755"
-
-    - name: Verify the program exists in the user's home directory
-      ansible.builtin.stat:
-        path: "{{ homedir }}/{{ program_name }}"
-      register: program_stat
-
-    - name: Fail if the program is missing
-      ansible.builtin.fail:
-        msg: "Program '{{ program_name }}' not found in {{ homedir }}"
-      when: not program_stat.stat.exists
-
-    - name: Ensure the program is executable
-      ansible.builtin.file:
-        path: "{{ homedir }}/{{ program_name }}"
+        dest: "{{ installer_dir }}/{{ program_name }}"
         mode: "0755"
 
     - name: Execute the program with AWS environment variables set
       ansible.builtin.command:
-        cmd: "{{ homedir }}/{{ program_name }} {{ program_args }}"
-        chdir: "{{ homedir }}"
+        argv: "{{ [installer_dir ~ '/' ~ program_name] + program_args }}"
+        chdir: "{{ installer_dir }}"
       environment:
         AWS_ACCESS_KEY_ID: "{{ aws_access_key_id }}"
         AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key }}"
         AWS_SESSION_TOKEN: "{{ aws_session_token }}"
-        AWS_DEFAULT_REGION: "{{ aws_default_region }}"
+        AWS_DEFAULT_REGION: "{{ aws_region }}"
       register: program_result
       changed_when: true
+      no_log: true
 
-    - name: Show program stdout
+    - name: Report Linux MGN installer completion
       ansible.builtin.debug:
-        var: program_result.stdout_lines
-      when: program_result.stdout_lines | length > 0
-
-    - name: Show program stderr
-      ansible.builtin.debug:
-        var: program_result.stderr_lines
-      when: program_result.stderr_lines | length > 0
+        msg: "Linux AWS MGN installer completed successfully."
