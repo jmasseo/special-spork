@@ -35,6 +35,51 @@
         root_available_bytes: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | default(0) }}"
       when: ansible_system != 'Win32NT'
 
+    - name: Check Linux RTC local-time setting
+      ansible.builtin.command:
+        argv:
+          - timedatectl
+          - show
+          - -p
+          - LocalRTC
+          - --value
+      register: linux_local_rtc
+      changed_when: false
+      when: ansible_system != 'Win32NT'
+
+    - name: Set Linux RTC to UTC
+      ansible.builtin.command:
+        argv:
+          - timedatectl
+          - set-local-rtc
+          - "0"
+      become: true
+      register: set_linux_local_rtc
+      changed_when: linux_local_rtc.stdout | trim != 'no'
+      when:
+        - ansible_system != 'Win32NT'
+        - linux_local_rtc.stdout | trim != 'no'
+
+    - name: Verify Linux RTC is set to UTC
+      ansible.builtin.command:
+        argv:
+          - timedatectl
+          - show
+          - -p
+          - LocalRTC
+          - --value
+      register: linux_local_rtc_after
+      changed_when: false
+      when: ansible_system != 'Win32NT'
+
+    - name: Assert Linux RTC is set to UTC
+      ansible.builtin.assert:
+        that:
+          - linux_local_rtc_after.stdout | trim == 'no'
+        fail_msg: "Linux RTC must be set to UTC. timedatectl set-local-rtc 0 did not produce LocalRTC=no."
+        success_msg: "Linux RTC is set to UTC."
+      when: ansible_system != 'Win32NT'
+
     - name: Check Windows C drive free space
       ansible.windows.win_powershell:
         script: |
