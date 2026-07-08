@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Review AWS MGN source server launch templates and optionally replace subnet IDs.
+Review AWS MGN source server launch templates and optionally update launch settings.
 
 Default behavior is dry-run. Pass --execute to create new launch template versions
 and set those versions as default.
@@ -25,17 +25,43 @@ except ImportError:  # pragma: no cover - dependency is validated at runtime
     BotoCoreError = ClientError = Exception
 
 
+DEFAULT_FAMILY_MAP = {
+    "c5": "c6i",
+    "m5": "m6i",
+    "r5": "r6i",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Inspect AWS MGN source servers, find launch templates using a source "
-            "subnet, and optionally create default template versions using a new subnet."
+            "Inspect AWS MGN source servers, find matching launch templates, and "
+            "optionally create default template versions with subnet and/or instance "
+            "type changes."
         )
     )
     parser.add_argument("--region", help="AWS region. Uses normal boto3 resolution if omitted.")
     parser.add_argument("--profile", help="AWS profile. Uses normal boto3 resolution if omitted.")
-    parser.add_argument("--from-subnet", required=True, help="Existing subnet ID to replace.")
-    parser.add_argument("--to-subnet", required=True, help="Replacement subnet ID.")
+    parser.add_argument("--from-subnet", help="Existing subnet ID to replace.")
+    parser.add_argument("--to-subnet", help="Replacement subnet ID.")
+    parser.add_argument(
+        "--upgrade-instance-types",
+        action="store_true",
+        help=(
+            "Upgrade mapped 5-series EC2 instance families in the launch template "
+            "InstanceType field. Default mappings: c5=c6i, m5=m6i, r5=r6i."
+        ),
+    )
+    parser.add_argument(
+        "--family-map",
+        action="append",
+        default=[],
+        metavar="FROM=TO",
+        help=(
+            "Instance family mapping to apply with --upgrade-instance-types. "
+            "Repeatable. Default mappings: c5=c6i, m5=m6i, r5=r6i."
+        ),
+    )
     parser.add_argument(
         "--execute",
         action="store_true",
@@ -108,6 +134,18 @@ def parse_tag_filters(tag_args: list[str]) -> dict[str, str]:
             raise SystemExit(f"Invalid --tag value {item!r}; tag key cannot be empty")
         tags[key] = value
     return tags
+
+
+def parse_family_map(family_map_args: list[str]) -> dict[str, str]:
+    family_map = dict(DEFAULT_FAMILY_MAP)
+    for item in family_map_args:
+        if "=" not in item:
+            raise SystemExit(f"Invalid --family-map value {item!r}; expected FROM=TO")
+        from_family, to_family = item.split("=", 1)
+        if not from_family or not to_family:
+            raise SystemExit(f"Invalid --family-map value {item!r}; both families are required")
+        family_map[from_family] = to_family
+    return family_map
 
 
 def make_session(args: argparse.Namespace):
@@ -192,12 +230,15 @@ def source_server_matches(
 
 def replace_subnet_ids(
     launch_template_data: dict[str, Any],
-    from_subnet: str,
-    to_subnet: str,
+    from_subnet: str | None,
+    to_subnet: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     changes: list[dict[str, Any]] = []
 
     network_interfaces = copy.deepcopy(launch_template_data.get("NetworkInterfaces") or [])
+    if not from_subnet or not to_subnet:
+        return network_interfaces, changes
+
     for index, network_interface in enumerate(network_interfaces):
         if network_interface.get("SubnetId") == from_subnet:
             network_interface["SubnetId"] = to_subnet
@@ -210,6 +251,57 @@ def replace_subnet_ids(
             )
 
     return network_interfaces, changes
+
+
+def upgraded_instance_type(instance_type: str, family_map: dict[str, str]) -> str | None:
+    if "." not in instance_type:
+        return None
+
+    family, size = instance_type.split(".", 1)
+    to_family = family_map.get(family)
+    if not to_family:
+        return None
+
+    return f"{to_family}.{size}"
+
+
+def build_launch_template_updates(
+    launch_template_data: dict[str, Any],
+    args: argparse.Namespace,
+    family_map: dict[str, str],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    updates: dict[str, Any] = {}
+    reasons: list[str] = []
+
+    network_interfaces, changes = replace_subnet_ids(
+        launch_template_data,
+        args.from_subnet,
+        args.to_subnet,
+    )
+    if changes:
+        updates["NetworkInterfaces"] = network_interfaces
+    elif args.from_subnet and args.to_subnet:
+        reasons.append("from-subnet-not-found-in-default-template")
+
+    if args.upgrade_instance_types:
+        instance_type = launch_template_data.get("InstanceType")
+        if instance_type:
+            new_instance_type = upgraded_instance_type(str(instance_type), family_map)
+            if new_instance_type:
+                updates["InstanceType"] = new_instance_type
+                changes.append(
+                    {
+                        "path": "LaunchTemplateData.InstanceType",
+                        "from": instance_type,
+                        "to": new_instance_type,
+                    }
+                )
+            else:
+                reasons.append("instance-type-not-mapped")
+        else:
+            reasons.append("no-instance-type-in-default-template")
+
+    return updates, changes, reasons
 
 
 def create_and_default_launch_template_version(
@@ -229,7 +321,7 @@ def create_and_default_launch_template_version(
     response = ec2_client.create_launch_template_version(
         LaunchTemplateId=launch_template_id,
         SourceVersion=source_version,
-        VersionDescription="MGN subnet swap",
+        VersionDescription="MGN launch template update",
         LaunchTemplateData=launch_template_data,
         ClientToken=str(uuid.uuid4()),
     )
@@ -255,6 +347,7 @@ def inspect_server(
     ec2_client,
     server: dict[str, Any],
     args: argparse.Namespace,
+    family_map: dict[str, str],
     launch_template_id_re: re.Pattern[str] | None,
 ) -> dict[str, Any]:
     source_server_id = server["sourceServerID"]
@@ -285,16 +378,19 @@ def inspect_server(
     result["sourceVersion"] = source_version
 
     launch_template_data = default_version.get("LaunchTemplateData") or {}
-    network_interfaces, changes = replace_subnet_ids(
-        launch_template_data,
-        args.from_subnet,
-        args.to_subnet,
+    if launch_template_data.get("InstanceType"):
+        result["instanceType"] = launch_template_data.get("InstanceType")
+
+    launch_template_updates, changes, skipped_reasons = build_launch_template_updates(
+        launch_template_data=launch_template_data,
+        args=args,
+        family_map=family_map,
     )
     result["changes"] = changes
 
     if not changes:
         result["status"] = "skipped"
-        result["reason"] = "from-subnet-not-found-in-default-template"
+        result["reason"] = ", ".join(skipped_reasons) or "no-matching-launch-template-settings"
         return result
 
     if not args.execute:
@@ -305,7 +401,7 @@ def inspect_server(
         ec2_client=ec2_client,
         launch_template_id=launch_template_id,
         source_version=source_version,
-        launch_template_data={"NetworkInterfaces": network_interfaces},
+        launch_template_data=launch_template_updates,
     )
     result["status"] = "updated"
     result["newDefaultVersion"] = new_version
@@ -326,8 +422,12 @@ def print_text_report(results: list[dict[str, Any]]) -> None:
         source_id = result["sourceServerID"]
         template_id = result.get("launchTemplateId") or "-"
         version = result.get("sourceVersion") or "-"
+        instance_type = result.get("instanceType") or "-"
         names = ", ".join(result.get("names") or []) or "-"
-        print(f"{result['status']}: {source_id} names={names} lt={template_id} version={version}")
+        print(
+            f"{result['status']}: {source_id} names={names} "
+            f"lt={template_id} version={version} instance={instance_type}"
+        )
         if result.get("reason"):
             print(f"  reason: {result['reason']}")
         for change in result.get("changes") or []:
@@ -338,9 +438,14 @@ def print_text_report(results: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     args = parse_args()
-    if args.from_subnet == args.to_subnet:
+    if bool(args.from_subnet) != bool(args.to_subnet):
+        raise SystemExit("--from-subnet and --to-subnet must be supplied together")
+    if args.from_subnet and args.from_subnet == args.to_subnet:
         raise SystemExit("--from-subnet and --to-subnet must be different")
+    if not args.from_subnet and not args.upgrade_instance_types:
+        raise SystemExit("Supply --from-subnet/--to-subnet, --upgrade-instance-types, or both")
 
+    family_map = parse_family_map(args.family_map)
     tag_filters = parse_tag_filters(args.tag)
     source_id_re = compile_regex(args.source_server_id_regex, "--source-server-id-regex")
     name_re = compile_regex(args.server_name_regex, "--server-name-regex")
@@ -374,7 +479,7 @@ def main() -> int:
                 continue
 
             try:
-                results.append(inspect_server(mgn_client, ec2_client, server, args, launch_template_id_re))
+                results.append(inspect_server(mgn_client, ec2_client, server, args, family_map, launch_template_id_re))
             except (BotoCoreError, ClientError, RuntimeError) as exc:
                 results.append(
                     {
